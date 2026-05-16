@@ -30,6 +30,15 @@ Other options:
                         mode, e.g.: --update_environment --copy_environment
   --help, -h            Show this help message and exit.
 
+API keys:
+  Create set-environment-vars.conf in the project directory listing shell
+  files to source, one per line (relative or absolute paths):
+    setOpenAIKey.sh
+    setOpenRouterKey.sh
+    /etc/evolvix/env.sh
+  Any listed file that exists will be mounted and sourced at startup.
+  Never commit secret files to git.
+
 Examples:
   ./claude-docker.sh                          # link mode (default)
   ./claude-docker.sh --copy_environment       # isolated venv per project
@@ -46,6 +55,42 @@ PROJECT_SLUG="$(echo "$PROJECT_DIR" | sed 's/[^a-zA-Z0-9]/-/g')"
 IMAGE_NAME="claude-code-env"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$HOME/.claude-venv"
+
+# ── Environment variable file discovery ──────────────────────────────
+# Read set-environment-vars.conf if present. Each non-comment line is
+# a shell file to source. Relative paths resolved from the conf file's directory.
+KEY_FILES=()
+API_KEYS_CONF="$PWD/set-environment-vars.conf"
+if [ -f "$API_KEYS_CONF" ]; then
+  CONF_DIR="$(cd "$(dirname "$API_KEYS_CONF")" && pwd)"
+  while IFS= read -r line; do
+    # Skip blank lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    # Resolve relative paths
+    if [[ "$line" != /* ]]; then
+      line="$CONF_DIR/$line"
+    fi
+    KEY_FILES+=("$line")
+  done < "$API_KEYS_CONF"
+fi
+
+# Build mount flags and container paths list for key files
+KEY_MOUNTS=""
+KEY_PATHS_IN_CONTAINER=""
+for keyfile in "${KEY_FILES[@]}"; do
+  if [ -f "$keyfile" ]; then
+    basename_key="$(basename "$keyfile")"
+    KEY_MOUNTS="$KEY_MOUNTS -v $keyfile:/home/node/api-keys/$basename_key:ro"
+    KEY_PATHS_IN_CONTAINER="$KEY_PATHS_IN_CONTAINER /home/node/api-keys/$basename_key"
+  else
+    echo "==> Warning: key file not found: $keyfile"
+  fi
+done
+
+# Pass the list of key paths into the container via env var
+if [ -n "$KEY_PATHS_IN_CONTAINER" ]; then
+  echo "==> API keys: $(echo $KEY_PATHS_IN_CONTAINER | tr ' ' '\n' | xargs -I{} basename {} | tr '\n' ' ')"
+fi
 
 # Detect host Python site-packages for --link_environment
 HOST_SITE_PACKAGES=""
@@ -71,6 +116,14 @@ cat > "$SCRIPT_DIR/entrypoint.sh" <<'ENTRY'
 #!/bin/bash
 set -e
 
+# ── Environment vars ──────────────────────────────────────────────────
+# Source any .sh files mounted into /home/node/api-keys/
+if [ -d "/home/node/api-keys" ]; then
+  for keyfile in /home/node/api-keys/*.sh; do
+    [ -f "$keyfile" ] && source "$keyfile"
+  done
+fi
+
 ENV_MODE="${ENV_MODE:-copy}"
 VENV_PATH="/opt/venv"
 REQ_FILE="/tmp/requirements.txt"
@@ -81,7 +134,6 @@ progress_pip_install() {
     local pip_cmd="$2"   # "pip" or "$VENV_PATH/bin/pip"
     local req_file="$3"
     shift 3
-    # Count total requirements (non-empty, non-comment lines)
     local total
     total=$(grep -cvE '^\s*($|#)' "$req_file" 2>/dev/null || echo 0)
     if [ "$total" -eq 0 ]; then
@@ -93,7 +145,6 @@ progress_pip_install() {
     local bar_width=$((cols - 30))
     [ "$bar_width" -lt 10 ] && bar_width=10
 
-    # Use a temp file for counters (pipe creates subshell, vars don't propagate)
     local counter_file
     counter_file=$(mktemp)
     echo "0" > "$counter_file"
@@ -111,10 +162,7 @@ progress_pip_install() {
         printf "\r  %s [%s%s] %3d%% (%d/%d)" "$label" "$bar_fill" "$bar_empty" "$pct" "$n" "$total"
     }
 
-    # Draw initial state
     draw_bar 0
-
-    # Run pip without --quiet so we get per-package output lines
     $pip_cmd install --progress-bar off -r "$req_file" "$@" 2>&1 | while IFS= read -r line; do
         case "$line" in
             *"Requirement already satisfied"*|*"Collecting "*|*"Successfully installed"*)
@@ -126,8 +174,6 @@ progress_pip_install() {
                 ;;
         esac
     done
-
-    # Final state
     draw_bar "$total"
     echo ""
     rm -f "$counter_file"
@@ -141,7 +187,6 @@ if [ "$ENV_MODE" = "link" ]; then
         echo "    $(find /opt/host-site-packages -maxdepth 1 -name '*.dist-info' | wc -l) packages available"
     fi
 
-    # Install any local (editable/file://) packages into a small overlay
     if [ -f "$REQ_FILE" ]; then
         local_pkgs=$(grep '@ file://' "$REQ_FILE" | sed 's/.*@ file:\/\///' || true)
         if [ -n "$local_pkgs" ]; then
@@ -171,20 +216,16 @@ if [ ! -f "$VENV_PATH/bin/python" ]; then
     python3 -m venv "$VENV_PATH"
 fi
 
-# Check if packages are actually installed (more than just pip/setuptools)
 PKG_COUNT=$("$VENV_PATH/bin/pip" list --format=freeze 2>/dev/null | wc -l)
 
 if [ "$PKG_COUNT" -le 3 ] || [ ! -f "$VENV_PATH/.req_hash" ] || [ "$REQ_HASH" != "$(cat "$VENV_PATH/.req_hash")" ]; then
     echo "==> Installing/updating packages ($PKG_COUNT found, expecting more)..."
 
-    # Prepare filtered requirements (no file:// entries)
     FILTERED_REQ=$(mktemp)
     grep -v '@ file://' "$REQ_FILE" > "$FILTERED_REQ" || true
-
     progress_pip_install "Packages" "$VENV_PATH/bin/pip" "$FILTERED_REQ"
     rm -f "$FILTERED_REQ"
 
-    # Install local packages (may need write access for egg-info)
     for pkg in $(grep '@ file://' "$REQ_FILE" | sed 's/.*@ file:\/\///'); do
         if [ -d "$pkg" ]; then
             echo "==> Installing local package: $pkg"
@@ -216,7 +257,7 @@ if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
   REQ_MOUNT="-v $SCRIPT_DIR/requirements.txt:/tmp/requirements.txt:ro"
 fi
 
-# Build mount flags for local development packages (rw needed for egg-info during pip build)
+# Build mount flags for local development packages
 LOCAL_MOUNTS=""
 if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
   while IFS= read -r pkg_path; do
@@ -245,7 +286,6 @@ CMD ["claude", "--dangerously-skip-permissions"]
 EOF
 
 GPU_FLAG=""
-# NVIDIA: prefer container runtime, fall back to explicit device passthrough
 if docker info --format '{{.Runtimes}}' 2>/dev/null | grep -q nvidia; then
   GPU_FLAG="--gpus all"
   echo "==> GPU: NVIDIA (nvidia container runtime)"
@@ -260,7 +300,6 @@ else
   fi
 fi
 
-# AMD/Intel: DRI render nodes and AMD KFD compute device
 for dev in /dev/dri/renderD*; do
   [ -c "$dev" ] && GPU_FLAG="$GPU_FLAG --device $dev"
 done
@@ -281,7 +320,6 @@ if [ "$ENV_MODE" = "link" ]; then
   echo "==> Link mode: mounting $HOST_SITE_PACKAGES (read-only)"
   ENV_MOUNTS="-v $HOST_SITE_PACKAGES:/opt/host-site-packages:ro"
 else
-  # Copy mode: mount persistent venv volume
   ENV_MOUNTS="-v $VENV_DIR:/opt/venv"
 fi
 
@@ -298,6 +336,7 @@ exec docker run -it --rm \
   $ENV_MOUNTS \
   $REQ_MOUNT \
   $LOCAL_MOUNTS \
+  $KEY_MOUNTS \
   $ENV_VARS \
   -e TERM=xterm-256color \
   -w "$PROJECT_DIR" \

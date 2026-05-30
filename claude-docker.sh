@@ -30,14 +30,27 @@ Other options:
                         mode, e.g.: --update_environment --copy_environment
   --help, -h            Show this help message and exit.
 
-API keys:
-  Create set-environment-vars.conf in the project directory listing shell
-  files to source, one per line (relative or absolute paths):
+API keys and secrets:
+  Create set-environment-vars.conf in the project directory listing files
+  to mount, one per line (relative or absolute paths):
     setOpenAIKey.sh
     setOpenRouterKey.sh
     /etc/evolvix/env.sh
-  Any listed file that exists will be mounted and sourced at startup.
+  .sh files are sourced at startup; all other files are mounted read-only
+  at /home/node/api-keys/<basename> but not sourced.
   Never commit secret files to git.
+
+GitHub SSH (push from container without exposing ~/.ssh):
+  Generate a dedicated key outside ~/.ssh:
+    mkdir -p ~/.claude-docker-keys
+    ssh-keygen -t ed25519 -f ~/.claude-docker-keys/github_ed25519 -N "" -C "claude-docker"
+  Add ~/.claude-docker-keys/github_ed25519.pub to GitHub SSH keys.
+  Create ~/.claude-docker-keys/setup-github-ssh.sh:
+    export GIT_SSH_COMMAND="ssh -i /home/node/api-keys/github_ed25519 \
+      -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+  Add both to set-environment-vars.conf:
+    ~/.claude-docker-keys/github_ed25519
+    ~/.claude-docker-keys/setup-github-ssh.sh
 
 Examples:
   ./claude-docker.sh                          # link mode (default)

@@ -66,6 +66,8 @@ if [ -f "$API_KEYS_CONF" ]; then
   while IFS= read -r line; do
     # Skip blank lines and comments
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    # Expand leading ~ to $HOME
+    line="${line/#\~/$HOME}"
     # Resolve relative paths
     if [[ "$line" != /* ]]; then
       line="$CONF_DIR/$line"

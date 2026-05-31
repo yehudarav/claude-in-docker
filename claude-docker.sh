@@ -360,6 +360,13 @@ if [ -n "$MAIN_REPO_DIR" ] && [ "$MAIN_REPO_DIR" != "$PROJECT_DIR" ]; then
   MAIN_REPO_MOUNT="-v $MAIN_REPO_DIR:$MAIN_REPO_DIR"
 fi
 
+# Mount host tools that are already installed into a guaranteed-in-PATH location
+HOST_TOOL_MOUNTS=""
+for tool in gh git; do
+  tool_path="$(command -v "$tool" 2>/dev/null || true)"
+  [ -n "$tool_path" ] && HOST_TOOL_MOUNTS="$HOST_TOOL_MOUNTS -v $tool_path:/usr/local/bin/$tool:ro"
+done
+
 echo "==> Starting Claude (env: ${ENV_MODE:-none})..."
 exec docker run -it --rm \
   --name "claude-$(basename "$PROJECT_DIR")" \
@@ -375,6 +382,7 @@ exec docker run -it --rm \
   $REQ_MOUNT \
   $LOCAL_MOUNTS \
   $KEY_MOUNTS \
+  $HOST_TOOL_MOUNTS \
   $ENV_VARS \
   -e TERM=xterm-256color \
   -w "$PROJECT_DIR" \

@@ -11,7 +11,7 @@ docker build -t "$IMAGE_NAME" -f - "$PROJECT_DIR" <<'EOF'
 FROM node:22-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
+    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv git \
     && rm -rf /var/lib/apt/lists/*
 
 USER node
@@ -27,7 +27,7 @@ fi
 
 # Mount host tools that are already installed into a guaranteed-in-PATH location
 HOST_TOOL_MOUNTS=""
-for tool in gh git; do
+for tool in gh; do
   tool_path="$(command -v "$tool" 2>/dev/null || true)"
   [ -n "$tool_path" ] && HOST_TOOL_MOUNTS="$HOST_TOOL_MOUNTS -v $tool_path:/usr/local/bin/$tool:ro"
 done

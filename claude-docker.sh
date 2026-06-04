@@ -130,6 +130,23 @@ if command -v python3 &>/dev/null; then
   HOST_SITE_PACKAGES="$(python3 -c 'import sysconfig; print(sysconfig.get_path("purelib"))' 2>/dev/null || true)"
 fi
 
+# Detect active host venv + its base interpreter/stdlib. Needed because the
+# container's `python3` (trixie ships 3.13) cannot load wheels built for a
+# different minor version (e.g. 3.11). Same-path bind-mounts let the venv's
+# absolute shebangs and pyvenv.cfg resolve unchanged inside the container.
+HOST_VENV=""
+HOST_PY_INTERP=""
+HOST_PY_STDLIB=""
+if command -v python3 &>/dev/null; then
+  HOST_VENV="$(python3 -c 'import sys; print(sys.prefix if sys.prefix != sys.base_prefix else "")' 2>/dev/null || true)"
+  _HOST_PY_BASE="$(python3 -c 'import sys; print(sys.base_prefix)' 2>/dev/null || true)"
+  _HOST_PY_VER="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
+  if [ -n "$_HOST_PY_BASE" ] && [ -n "$_HOST_PY_VER" ]; then
+    HOST_PY_INTERP="$_HOST_PY_BASE/bin/python$_HOST_PY_VER"
+    HOST_PY_STDLIB="$_HOST_PY_BASE/lib/python$_HOST_PY_VER"
+  fi
+fi
+
 # Determine env mode: default to link (shared host env) if host Python exists
 if [ -z "$ENV_MODE" ]; then
   if [ -n "$HOST_SITE_PACKAGES" ] && [ -d "$HOST_SITE_PACKAGES" ]; then
@@ -213,10 +230,26 @@ progress_pip_install() {
 
 # ── Link mode: host site-packages is mounted, just set PATH ──────────
 if [ "$ENV_MODE" = "link" ]; then
-    echo "==> Link mode: using host Python environment"
-    if [ -d "/opt/host-site-packages" ]; then
+    if [ -n "$HOST_VENV" ] && [ -f "$HOST_VENV/bin/activate" ]; then
+        echo "==> Link mode: activating host venv at $HOST_VENV"
+        # shellcheck disable=SC1091
+        source "$HOST_VENV/bin/activate"
+        # Add CUDA libs (system toolkit if mounted + pip nvidia-* wheels) so
+        # HOOMD / Torch find libcudart.so etc. --gpus all only ships the driver.
+        CUDA_LIB_DIRS=""
+        for d in /usr/local/cuda/lib64 /usr/local/cuda/targets/x86_64-linux/lib; do
+            [ -d "$d" ] && CUDA_LIB_DIRS="${CUDA_LIB_DIRS:+$CUDA_LIB_DIRS:}$d"
+        done
+        for d in "$HOST_VENV"/lib/python*/site-packages/nvidia/*/lib; do
+            [ -d "$d" ] && CUDA_LIB_DIRS="${CUDA_LIB_DIRS:+$CUDA_LIB_DIRS:}$d"
+        done
+        [ -n "$CUDA_LIB_DIRS" ] && export LD_LIBRARY_PATH="$CUDA_LIB_DIRS${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    elif [ -d "/opt/host-site-packages" ]; then
+        echo "==> Link mode: using host site-packages (no venv detected)"
         export PYTHONPATH="/opt/host-site-packages:${PYTHONPATH:-}"
         echo "    $(find /opt/host-site-packages -maxdepth 1 -name '*.dist-info' | wc -l) packages available"
+    else
+        echo "==> Link mode: no venv and no /opt/host-site-packages — Python imports may fail"
     fi
 
     if [ -f "$REQ_FILE" ]; then
@@ -301,9 +334,17 @@ fi
 
 echo "==> Building Docker image..."
 docker build -t "$IMAGE_NAME" -f - "$SCRIPT_DIR" <<'EOF'
-FROM node:22-bookworm
+FROM node:20-trixie
+# Base image carries glibc 2.41 (vs bookworm's 2.36) so host-built .so files
+# requiring GLIBC_2.38 (e.g. HOOMD 7) can load. The apt line installs git plus
+# the .so deps the host Python 3.11 stdlib + most scientific wheels link
+# against — see docs/claude-docker-gpu-setup.md (Step A) in glycocalyx-np.
+# python3/pip/venv are intentionally NOT installed: the venv is bind-mounted
+# from the host along with /usr/bin/python3.11 and its stdlib.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv git \
+    && apt-get install -y --no-install-recommends \
+        git \
+        libssl3 libffi8 libsqlite3-0 liblzma5 libbz2-1.0 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -367,6 +408,60 @@ for tool in gh; do
   [ -n "$tool_path" ] && HOST_TOOL_MOUNTS="$HOST_TOOL_MOUNTS -v $tool_path:/usr/local/bin/$tool:ro"
 done
 
+# Same-path bind mounts so a host venv (and its base interpreter + stdlib) is
+# usable inside the container. Only built in link mode; non-link projects fall
+# back to the existing /opt/venv flow. ENV_VARS gains HOST_VENV so the
+# entrypoint can auto-activate.
+PY_INTERP_MOUNTS=""
+if [ "$ENV_MODE" = "link" ]; then
+  [ -n "$HOST_VENV" ]      && [ -d "$HOST_VENV" ]      && PY_INTERP_MOUNTS="$PY_INTERP_MOUNTS -v $HOST_VENV:$HOST_VENV:ro"
+  [ -n "$HOST_PY_INTERP" ] && [ -f "$HOST_PY_INTERP" ] && PY_INTERP_MOUNTS="$PY_INTERP_MOUNTS -v $HOST_PY_INTERP:$HOST_PY_INTERP:ro"
+  [ -n "$HOST_PY_STDLIB" ] && [ -d "$HOST_PY_STDLIB" ] && PY_INTERP_MOUNTS="$PY_INTERP_MOUNTS -v $HOST_PY_STDLIB:$HOST_PY_STDLIB:ro"
+  [ -n "$HOST_VENV" ]      && ENV_VARS="$ENV_VARS -e HOST_VENV=$HOST_VENV"
+fi
+
+# Mount host CUDA toolkit if present — host HOOMD may be linked against
+# /usr/local/cuda/.../libcudart.so. --gpus all only injects the driver.
+CUDA_MOUNT=""
+[ -d /usr/local/cuda ] && CUDA_MOUNT="-v /usr/local/cuda:/usr/local/cuda:ro"
+
+# Mount each host PYTHONPATH directory read-only at the same path so dev
+# packages (e.g. editable installs activated via `export PYTHONPATH=...`)
+# resolve inside the container. Dirs already covered by other mounts
+# (project, main repo, host venv) are skipped to avoid double-mount.
+PYTHONPATH_MOUNTS=""
+PYTHONPATH_IN_CONTAINER=""
+if [ -n "${PYTHONPATH:-}" ]; then
+  _SEEN=""
+  while IFS= read -r entry; do
+    [ -z "$entry" ] && continue
+    [ -d "$entry" ] || continue
+    abs="$(cd "$entry" 2>/dev/null && pwd)" || continue
+    [ -z "$abs" ] && continue
+    case ":$_SEEN:" in *":$abs:"*) continue;; esac
+    _SEEN="${_SEEN:+$_SEEN:}$abs"
+    PYTHONPATH_IN_CONTAINER="${PYTHONPATH_IN_CONTAINER:+$PYTHONPATH_IN_CONTAINER:}$abs"
+    # Already mounted by other rules — keep in PYTHONPATH but don't re-mount.
+    [ "$abs" = "$PROJECT_DIR" ] && continue
+    case "$abs" in "$PROJECT_DIR"/*) continue;; esac
+    if [ -n "$MAIN_REPO_DIR" ]; then
+      [ "$abs" = "$MAIN_REPO_DIR" ] && continue
+      case "$abs" in "$MAIN_REPO_DIR"/*) continue;; esac
+    fi
+    if [ -n "$HOST_VENV" ]; then
+      case "$abs" in "$HOST_VENV"|"$HOST_VENV"/*) continue;; esac
+    fi
+    PYTHONPATH_MOUNTS="$PYTHONPATH_MOUNTS -v $abs:$abs:ro"
+  done < <(printf '%s' "$PYTHONPATH" | tr ':' '\n')
+  if [ -n "$PYTHONPATH_MOUNTS" ]; then
+    echo "==> PYTHONPATH: mounting external dirs read-only"
+    for d in $(printf '%s' "$PYTHONPATH_MOUNTS" | tr ' ' '\n' | grep '^/' | cut -d: -f1); do
+      echo "    $d"
+    done
+  fi
+  [ -n "$PYTHONPATH_IN_CONTAINER" ] && ENV_VARS="$ENV_VARS -e PYTHONPATH=$PYTHONPATH_IN_CONTAINER"
+fi
+
 echo "==> Starting Claude (env: ${ENV_MODE:-none})..."
 exec docker run -it --rm \
   --name "claude-$(basename "$PROJECT_DIR")" \
@@ -379,6 +474,9 @@ exec docker run -it --rm \
   -v "$HOME/.claude/projects/$PROJECT_SLUG":/home/node/.claude/projects/$PROJECT_SLUG \
   -v "$HOME/.claude.json":/home/node/.claude.json \
   $ENV_MOUNTS \
+  $PY_INTERP_MOUNTS \
+  $PYTHONPATH_MOUNTS \
+  $CUDA_MOUNT \
   $REQ_MOUNT \
   $LOCAL_MOUNTS \
   $KEY_MOUNTS \

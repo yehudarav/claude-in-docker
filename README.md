@@ -89,6 +89,25 @@ Add both to your project's `set-environment-vars.conf`:
 
 The key is mounted (not sourced) and the helper script is sourced to point `git` at it. The rest of your `~/.ssh` is never visible to the container.
 
+## Read-only mounts
+
+Some host-installed tools need their config or data directory to be present on disk to work (e.g. a library that reads `~/.toolname/config.sys` on import). To make those visible inside the container without copying or exposing the whole home directory, create `readonly-mounts.conf` listing host paths — one per line, absolute, relative, or `~`-prefixed:
+
+```
+~/.pyhera
+~/.config/myapp
+/etc/somecfg
+data/shared
+```
+
+Each existing entry (file or directory) is bind-mounted **read-only at the same absolute path** inside the container, so imports and lookups using that path resolve unchanged. Missing paths print a warning and are skipped.
+
+Lookup order:
+1. `./readonly-mounts.conf` in the project directory
+2. `<claude-docker.sh dir>/readonly-mounts.conf` (global default)
+
+Both files are read and merged, with duplicates skipped. Use the global one for stable per-user state (`~/.pyhera`, dotfile dirs) and the project one for paths only one project needs. `#` lines and blanks are ignored.
+
 ## GPU support
 
 The script auto-detects what's available and passes it through:

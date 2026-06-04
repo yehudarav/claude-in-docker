@@ -40,6 +40,12 @@ API keys and secrets:
   at /home/node/api-keys/<basename> but not sourced.
   Never commit secret files to git.
 
+Read-only mounts (configs, data dirs, etc.):
+  Create readonly-mounts.conf listing host paths (files or directories) to
+  mount read-only at the SAME path inside the container, one per line.
+  Looked up in the project directory first, then in the script directory
+  (global default). Both files are read and merged. Supports ~, # comments.
+
 GitHub SSH (push from container without exposing ~/.ssh):
   Generate a dedicated key outside ~/.ssh:
     mkdir -p ~/.claude-docker-keys
@@ -122,6 +128,40 @@ done
 # Pass the list of key paths into the container via env var
 if [ -n "$KEY_PATHS_IN_CONTAINER" ]; then
   echo "==> API keys: $(echo $KEY_PATHS_IN_CONTAINER | tr ' ' '\n' | xargs -I{} basename {} | tr '\n' ' ')"
+fi
+
+# ── Read-only mount discovery ────────────────────────────────────────
+# Read readonly-mounts.conf if present. Each non-comment line is a host
+# path mounted read-only at the same path inside the container. Checks
+# project dir first then script dir (global), merging both lists.
+RO_PATHS=()
+_RO_SEEN=""
+for _ro_conf in "$PWD/readonly-mounts.conf" "$SCRIPT_DIR/readonly-mounts.conf"; do
+  [ -f "$_ro_conf" ] || continue
+  _RO_CONF_DIR="$(cd "$(dirname "$_ro_conf")" && pwd)"
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    line="${line/#\~/$HOME}"
+    if [[ "$line" != /* ]]; then
+      line="$_RO_CONF_DIR/$line"
+    fi
+    case ":$_RO_SEEN:" in *":$line:"*) continue;; esac
+    _RO_SEEN="${_RO_SEEN:+$_RO_SEEN:}$line"
+    RO_PATHS+=("$line")
+  done < "$_ro_conf"
+done
+
+RO_MOUNTS=""
+for _p in "${RO_PATHS[@]}"; do
+  if [ -e "$_p" ]; then
+    RO_MOUNTS="$RO_MOUNTS -v $_p:$_p:ro"
+  else
+    echo "==> Warning: readonly mount path not found: $_p"
+  fi
+done
+if [ -n "$RO_MOUNTS" ]; then
+  echo "==> Read-only mounts: ${#RO_PATHS[@]} path(s)"
+  for _p in "${RO_PATHS[@]}"; do echo "    $_p"; done
 fi
 
 # Detect host Python site-packages for --link_environment
@@ -480,6 +520,7 @@ exec docker run -it --rm \
   $REQ_MOUNT \
   $LOCAL_MOUNTS \
   $KEY_MOUNTS \
+  $RO_MOUNTS \
   $HOST_TOOL_MOUNTS \
   $ENV_VARS \
   -e TERM=xterm-256color \

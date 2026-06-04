@@ -38,6 +38,12 @@ claude-docker.sh --update_environment --copy_environment    # snapshot, then cop
 
 If neither flag is passed, the script picks `link` when the host has Python, else `copy` when a `requirements.txt` exists, else no env setup.
 
+### Editable installs and `PYTHONPATH`
+
+If your host shell exports `PYTHONPATH` (e.g. dev packages activated via `export PYTHONPATH=/path/to/pkg:$PYTHONPATH`), each existing directory is mounted into the container read-only at the same path, and `PYTHONPATH` is forwarded so `import` resolves there. Directories already covered by other mounts (project, main repo, host venv) stay in `PYTHONPATH` but aren't re-mounted.
+
+No-op when `PYTHONPATH` is unset.
+
 ## API keys and secrets
 
 Create `set-environment-vars.conf` in your project directory listing files to mount into the container. One path per line — absolute, relative, or `~`-prefixed:

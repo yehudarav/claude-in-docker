@@ -374,6 +374,9 @@ fi
 
 echo "==> Building Docker image..."
 docker build -t "$IMAGE_NAME" -f - "$SCRIPT_DIR" <<'EOF'
+# Stage 1: pull in a full TeX Live 2026 tree from the official CTAN image
+FROM texlive/texlive:latest AS tex
+
 FROM node:20-trixie
 # Base image carries glibc 2.41 (vs bookworm's 2.36) so host-built .so files
 # requiring GLIBC_2.38 (e.g. HOOMD 7) can load. The apt line installs git plus
@@ -381,18 +384,23 @@ FROM node:20-trixie
 # against — see docs/claude-docker-gpu-setup.md (Step A) in glycocalyx-np.
 # python3/pip/venv are intentionally NOT installed: the venv is bind-mounted
 # from the host along with /usr/bin/python3.11 and its stdlib.
+# perl + fontconfig are TeX Live runtime deps (latexmk, fontspec, xelatex).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git \
         libssl3 libffi8 libsqlite3-0 liblzma5 libbz2-1.0 libgomp1 \
+        perl fontconfig \
     && rm -rf /var/lib/apt/lists/*
+
+# Bring in the entire TeX Live tree from the official image
+COPY --from=tex /usr/local/texlive /usr/local/texlive
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER node
 ENV NPM_CONFIG_PREFIX=/home/node/.npm-global
-ENV PATH=/home/node/.npm-global/bin:/opt/venv/bin:$PATH
+ENV PATH=/home/node/.npm-global/bin:/opt/venv/bin:/usr/local/texlive/2026/bin/x86_64-linux:$PATH
 RUN npm install -g @anthropic-ai/claude-code
 ENTRYPOINT ["entrypoint.sh"]
 CMD ["claude", "--dangerously-skip-permissions"]

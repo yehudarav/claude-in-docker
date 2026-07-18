@@ -1,14 +1,43 @@
 #!/bin/bash
 set -e
 
+# ── Persistent worker container ──────────────────────────────────────
+CONTAINER_NAME="claude-worker"
+PROJECTS_DIR="${EVOLVIX_PROJECTS_DIR:-$HOME/evolvix-projects}"
+DISPATCH_DIR="${EVOLVIX_DISPATCH_DIR:-/tmp/evolvix-dispatch}"
+
+# Handle worker lifecycle subcommands before any setup or image build.
+case "$1" in
+  --stop)
+    if docker stop "$CONTAINER_NAME" >/dev/null 2>&1; then
+      echo "Claude worker stopped."
+    else
+      echo "No running worker."
+    fi
+    exit 0
+    ;;
+  --status)
+    if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+      docker ps --filter "name=^${CONTAINER_NAME}$" \
+        --format $'Name: {{.Names}}\nStatus: {{.Status}}\nUptime: {{.RunningFor}}'
+      exit 0
+    else
+      echo "No running worker."
+      exit 1
+    fi
+    ;;
+esac
+
 # Parse flags
 UPDATE_ENV=false
+DAEMON_MODE=false
 ENV_MODE=""
 for arg in "$@"; do
   case "$arg" in
     --update_environment) UPDATE_ENV=true ;;
     --copy_environment)   ENV_MODE="copy" ;;
     --link_environment)   ENV_MODE="link" ;;
+    --daemon)             DAEMON_MODE=true ;;
     --help|-h)
       cat <<'HELP'
 Usage: claude-docker.sh [OPTIONS]
@@ -29,6 +58,18 @@ Other options:
                         requirements.txt before starting. Combine with either
                         mode, e.g.: --update_environment --copy_environment
   --help, -h            Show this help message and exit.
+
+Persistent worker mode (for MCP dispatch):
+  --daemon              Start a persistent worker container (named
+                        "claude-worker") in the background. The dispatcher
+                        drives it via `docker exec`. Mounts
+                        $EVOLVIX_PROJECTS_DIR (default ~/evolvix-projects)
+                        at /workspace/projects and $EVOLVIX_DISPATCH_DIR
+                        (default /tmp/evolvix-dispatch) at /workspace/dispatch.
+                        SSH keys ~/.ssh/id_evolvix and ~/.ssh/id_nfp are
+                        mounted read-only if present.
+  --stop                Stop the persistent worker.
+  --status              Show worker status. Exit 1 if not running.
 
 API keys and secrets:
   Create set-environment-vars.conf in the project directory listing files
@@ -68,6 +109,18 @@ HELP
       ;;
   esac
 done
+
+# --daemon: if a worker is already running, report and exit before any setup.
+if [ "$DAEMON_MODE" = true ]; then
+  if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+    echo "Claude worker already running (container: $CONTAINER_NAME)"
+    docker ps --filter "name=^${CONTAINER_NAME}$" --format 'Status: {{.Status}}'
+    exit 0
+  fi
+  # Clear any stopped container carrying the same name so `docker run` succeeds.
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  mkdir -p "$PROJECTS_DIR" "$DISPATCH_DIR"
+fi
 
 PROJECT_DIR="$(pwd)"
 PROJECT_SLUG="$(echo "$PROJECT_DIR" | sed 's/[^a-zA-Z0-9]/-/g')"
@@ -211,6 +264,34 @@ if [ -d "/home/node/api-keys" ]; then
   for keyfile in /home/node/api-keys/*.sh; do
     [ -f "$keyfile" ] && source "$keyfile"
   done
+fi
+
+# ── Persistent worker one-time setup ──────────────────────────────────
+if [ "${CLAUDE_DAEMON:-}" = "1" ]; then
+  git config --global user.name  "Evolvix Dispatch"
+  git config --global user.email "dispatch@evolvix.ai"
+fi
+
+# SSH config for multiple GitHub orgs. Self-gated on mounted key files, so
+# it is a no-op unless the daemon mode mounts them.
+mkdir -p /home/node/.ssh
+if [ -f /home/node/.ssh/id_evolvix ] || [ -f /home/node/.ssh/id_nfp ]; then
+  touch /home/node/.ssh/config
+  if ! grep -q 'Host github-evolvix' /home/node/.ssh/config 2>/dev/null; then
+    cat >> /home/node/.ssh/config <<'SSH'
+Host github-evolvix
+  HostName github.com
+  IdentityFile /home/node/.ssh/id_evolvix
+  IdentitiesOnly yes
+
+Host github-nfp
+  HostName github.com
+  IdentityFile /home/node/.ssh/id_nfp
+  IdentitiesOnly yes
+SSH
+  fi
+  chmod 700 /home/node/.ssh
+  chmod 600 /home/node/.ssh/config
 fi
 
 ENV_MODE="${ENV_MODE:-copy}"
@@ -510,6 +591,61 @@ if [ -n "${PYTHONPATH:-}" ]; then
   [ -n "$PYTHONPATH_IN_CONTAINER" ] && ENV_VARS="$ENV_VARS -e PYTHONPATH=$PYTHONPATH_IN_CONTAINER"
 fi
 
+# ── Daemon-only mounts ───────────────────────────────────────────────
+# SSH keys for multi-org GitHub push. Same-basename inside the container so
+# the entrypoint's ~/.ssh/config identityFile lines resolve.
+SSH_MOUNTS=""
+if [ "$DAEMON_MODE" = true ]; then
+  for keyfile in id_evolvix id_nfp; do
+    if [ -f "$HOME/.ssh/$keyfile" ]; then
+      SSH_MOUNTS="$SSH_MOUNTS -v $HOME/.ssh/$keyfile:/home/node/.ssh/$keyfile:ro"
+    fi
+  done
+fi
+
+# Persistent project clones + per-dispatch worktrees. Daemon-only so the
+# interactive mode is unchanged.
+DISPATCH_MOUNTS=""
+if [ "$DAEMON_MODE" = true ]; then
+  DISPATCH_MOUNTS="-v $PROJECTS_DIR:/workspace/projects -v $DISPATCH_DIR:/workspace/dispatch"
+fi
+
+if [ "$DAEMON_MODE" = true ]; then
+  echo "==> Starting persistent Claude worker (container: $CONTAINER_NAME)..."
+  docker run -d \
+    --name "$CONTAINER_NAME" \
+    --restart unless-stopped \
+    --add-host=host.docker.internal:host-gateway \
+    $GPU_FLAG \
+    -v "$HOME/.claude":/home/node/.claude \
+    -v "$HOME/.claude":"$HOME/.claude" \
+    --tmpfs /home/node/.claude/projects:uid=1000,gid=1000 \
+    -v "$HOME/.claude.json":/home/node/.claude.json \
+    $ENV_MOUNTS \
+    $PY_INTERP_MOUNTS \
+    $PYTHONPATH_MOUNTS \
+    $CUDA_MOUNT \
+    $REQ_MOUNT \
+    $LOCAL_MOUNTS \
+    $KEY_MOUNTS \
+    $RO_MOUNTS \
+    $HOST_TOOL_MOUNTS \
+    $SSH_MOUNTS \
+    $DISPATCH_MOUNTS \
+    $ENV_VARS \
+    -e CLAUDE_DAEMON=1 \
+    -e TERM=xterm-256color \
+    -w /workspace \
+    "$IMAGE_NAME" \
+    tail -f /dev/null >/dev/null
+
+  echo "Claude worker started (container: $CONTAINER_NAME)"
+  echo "  Projects:  /workspace/projects  (host: $PROJECTS_DIR)"
+  echo "  Dispatch:  /workspace/dispatch  (host: $DISPATCH_DIR)"
+  echo "  Stop with: $0 --stop"
+  exit 0
+fi
+
 echo "==> Starting Claude (env: ${ENV_MODE:-none})..."
 exec docker run -it --rm \
   --name "claude-$(basename "$PROJECT_DIR")" \
@@ -518,6 +654,7 @@ exec docker run -it --rm \
   -v "$PROJECT_DIR":"$PROJECT_DIR" \
   $MAIN_REPO_MOUNT \
   -v "$HOME/.claude":/home/node/.claude \
+  -v "$HOME/.claude":"$HOME/.claude" \
   --tmpfs /home/node/.claude/projects:uid=1000,gid=1000 \
   -v "$HOME/.claude/projects/$PROJECT_SLUG":/home/node/.claude/projects/$PROJECT_SLUG \
   -v "$HOME/.claude.json":/home/node/.claude.json \

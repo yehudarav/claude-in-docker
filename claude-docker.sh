@@ -2,14 +2,21 @@
 set -e
 
 # ── Persistent worker container ──────────────────────────────────────
-CONTAINER_NAME="claude-worker"
-PROJECTS_DIR="${EVOLVIX_PROJECTS_DIR:-$HOME/evolvix-projects}"
-DISPATCH_DIR="${EVOLVIX_DISPATCH_DIR:-/tmp/evolvix-dispatch}"
+# Load optional user-wide config; sets CLAUDE_* env vars used below.
+# Generate a template with `make docker-config`.
+if [ -f "$HOME/.claude/docker.env" ]; then
+  # shellcheck disable=SC1091
+  . "$HOME/.claude/docker.env"
+fi
+
+CLAUDE_CONTAINER_NAME="${CLAUDE_CONTAINER_NAME:-claude-worker}"
+CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/claude-projects}"
+CLAUDE_DISPATCH_DIR="${CLAUDE_DISPATCH_DIR:-/tmp/claude-dispatch}"
 
 # Handle worker lifecycle subcommands before any setup or image build.
 case "$1" in
   --stop)
-    if docker stop "$CONTAINER_NAME" >/dev/null 2>&1; then
+    if docker stop "$CLAUDE_CONTAINER_NAME" >/dev/null 2>&1; then
       echo "Claude worker stopped."
     else
       echo "No running worker."
@@ -17,8 +24,8 @@ case "$1" in
     exit 0
     ;;
   --status)
-    if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-      docker ps --filter "name=^${CONTAINER_NAME}$" \
+    if docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CLAUDE_CONTAINER_NAME}$"; then
+      docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" \
         --format $'Name: {{.Names}}\nStatus: {{.Status}}\nUptime: {{.RunningFor}}'
       exit 0
     else
@@ -60,14 +67,16 @@ Other options:
   --help, -h            Show this help message and exit.
 
 Persistent worker mode (for MCP dispatch):
-  --daemon              Start a persistent worker container (named
-                        "claude-worker") in the background. The dispatcher
-                        drives it via `docker exec`. Mounts
-                        $EVOLVIX_PROJECTS_DIR (default ~/evolvix-projects)
-                        at /workspace/projects and $EVOLVIX_DISPATCH_DIR
-                        (default /tmp/evolvix-dispatch) at /workspace/dispatch.
-                        SSH keys ~/.ssh/id_evolvix and ~/.ssh/id_nfp are
-                        mounted read-only if present.
+  --daemon              Start a persistent worker container in the background.
+                        The dispatcher drives it via `docker exec`. Mounts
+                        $CLAUDE_PROJECTS_DIR (default ~/claude-projects) at
+                        /workspace/projects and $CLAUDE_DISPATCH_DIR (default
+                        /tmp/claude-dispatch) at /workspace/dispatch. Mounts
+                        $HOME/.ssh read-only so the container inherits your
+                        host's key-alias mapping. Container is named
+                        $CLAUDE_CONTAINER_NAME (default claude-worker).
+                        Settings can also be placed in ~/.claude/docker.env
+                        — generate a template with `make docker-config`.
   --stop                Stop the persistent worker.
   --status              Show worker status. Exit 1 if not running.
 
@@ -76,7 +85,7 @@ API keys and secrets:
   to mount, one per line (relative or absolute paths):
     setOpenAIKey.sh
     setOpenRouterKey.sh
-    /etc/evolvix/env.sh
+    /etc/mycompany/env.sh
   .sh files are sourced at startup; all other files are mounted read-only
   at /home/node/api-keys/<basename> but not sourced.
   Never commit secret files to git.
@@ -112,14 +121,14 @@ done
 
 # --daemon: if a worker is already running, report and exit before any setup.
 if [ "$DAEMON_MODE" = true ]; then
-  if docker ps --filter "name=^${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-    echo "Claude worker already running (container: $CONTAINER_NAME)"
-    docker ps --filter "name=^${CONTAINER_NAME}$" --format 'Status: {{.Status}}'
+  if docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CLAUDE_CONTAINER_NAME}$"; then
+    echo "Claude worker already running (container: $CLAUDE_CONTAINER_NAME)"
+    docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format 'Status: {{.Status}}'
     exit 0
   fi
   # Clear any stopped container carrying the same name so `docker run` succeeds.
-  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
-  mkdir -p "$PROJECTS_DIR" "$DISPATCH_DIR"
+  docker rm -f "$CLAUDE_CONTAINER_NAME" >/dev/null 2>&1 || true
+  mkdir -p "$CLAUDE_PROJECTS_DIR" "$CLAUDE_DISPATCH_DIR"
 fi
 
 PROJECT_DIR="$(pwd)"
@@ -264,34 +273,6 @@ if [ -d "/home/node/api-keys" ]; then
   for keyfile in /home/node/api-keys/*.sh; do
     [ -f "$keyfile" ] && source "$keyfile"
   done
-fi
-
-# ── Persistent worker one-time setup ──────────────────────────────────
-if [ "${CLAUDE_DAEMON:-}" = "1" ]; then
-  git config --global user.name  "Evolvix Dispatch"
-  git config --global user.email "dispatch@evolvix.ai"
-fi
-
-# SSH config for multiple GitHub orgs. Self-gated on mounted key files, so
-# it is a no-op unless the daemon mode mounts them.
-mkdir -p /home/node/.ssh
-if [ -f /home/node/.ssh/id_evolvix ] || [ -f /home/node/.ssh/id_nfp ]; then
-  touch /home/node/.ssh/config
-  if ! grep -q 'Host github-evolvix' /home/node/.ssh/config 2>/dev/null; then
-    cat >> /home/node/.ssh/config <<'SSH'
-Host github-evolvix
-  HostName github.com
-  IdentityFile /home/node/.ssh/id_evolvix
-  IdentitiesOnly yes
-
-Host github-nfp
-  HostName github.com
-  IdentityFile /home/node/.ssh/id_nfp
-  IdentitiesOnly yes
-SSH
-  fi
-  chmod 700 /home/node/.ssh
-  chmod 600 /home/node/.ssh/config
 fi
 
 ENV_MODE="${ENV_MODE:-copy}"
@@ -592,28 +573,25 @@ if [ -n "${PYTHONPATH:-}" ]; then
 fi
 
 # ── Daemon-only mounts ───────────────────────────────────────────────
-# SSH keys for multi-org GitHub push. Same-basename inside the container so
-# the entrypoint's ~/.ssh/config identityFile lines resolve.
+# Mount the host's ~/.ssh read-only so the container inherits the host's
+# key-alias mapping from ~/.ssh/config. No config generation happens inside
+# the container.
 SSH_MOUNTS=""
-if [ "$DAEMON_MODE" = true ]; then
-  for keyfile in id_evolvix id_nfp; do
-    if [ -f "$HOME/.ssh/$keyfile" ]; then
-      SSH_MOUNTS="$SSH_MOUNTS -v $HOME/.ssh/$keyfile:/home/node/.ssh/$keyfile:ro"
-    fi
-  done
+if [ "$DAEMON_MODE" = true ] && [ -d "$HOME/.ssh" ]; then
+  SSH_MOUNTS="-v $HOME/.ssh:/home/node/.ssh:ro"
 fi
 
 # Persistent project clones + per-dispatch worktrees. Daemon-only so the
 # interactive mode is unchanged.
 DISPATCH_MOUNTS=""
 if [ "$DAEMON_MODE" = true ]; then
-  DISPATCH_MOUNTS="-v $PROJECTS_DIR:/workspace/projects -v $DISPATCH_DIR:/workspace/dispatch"
+  DISPATCH_MOUNTS="-v $CLAUDE_PROJECTS_DIR:/workspace/projects -v $CLAUDE_DISPATCH_DIR:/workspace/dispatch"
 fi
 
 if [ "$DAEMON_MODE" = true ]; then
-  echo "==> Starting persistent Claude worker (container: $CONTAINER_NAME)..."
+  echo "==> Starting persistent Claude worker (container: $CLAUDE_CONTAINER_NAME)..."
   docker run -d \
-    --name "$CONTAINER_NAME" \
+    --name "$CLAUDE_CONTAINER_NAME" \
     --restart unless-stopped \
     --add-host=host.docker.internal:host-gateway \
     $GPU_FLAG \
@@ -639,9 +617,9 @@ if [ "$DAEMON_MODE" = true ]; then
     "$IMAGE_NAME" \
     tail -f /dev/null >/dev/null
 
-  echo "Claude worker started (container: $CONTAINER_NAME)"
-  echo "  Projects:  /workspace/projects  (host: $PROJECTS_DIR)"
-  echo "  Dispatch:  /workspace/dispatch  (host: $DISPATCH_DIR)"
+  echo "Claude worker started (container: $CLAUDE_CONTAINER_NAME)"
+  echo "  Projects:  /workspace/projects  (host: $CLAUDE_PROJECTS_DIR)"
+  echo "  Dispatch:  /workspace/dispatch  (host: $CLAUDE_DISPATCH_DIR)"
   echo "  Stop with: $0 --stop"
   exit 0
 fi

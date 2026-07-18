@@ -13,38 +13,39 @@ CLAUDE_CONTAINER_NAME="${CLAUDE_CONTAINER_NAME:-claude-worker}"
 CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/claude-projects}"
 CLAUDE_DISPATCH_DIR="${CLAUDE_DISPATCH_DIR:-/tmp/claude-dispatch}"
 
-# Handle worker lifecycle subcommands before any setup or image build.
-case "$1" in
-  --stop)
-    if docker stop "$CLAUDE_CONTAINER_NAME" >/dev/null 2>&1; then
-      echo "Claude worker stopped."
-    else
-      echo "No running worker."
-    fi
-    exit 0
-    ;;
-  --status)
-    if docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CLAUDE_CONTAINER_NAME}$"; then
-      docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" \
-        --format $'Name: {{.Names}}\nStatus: {{.Status}}\nUptime: {{.RunningFor}}'
-      exit 0
-    else
-      echo "No running worker."
-      exit 1
-    fi
-    ;;
-esac
-
 # Parse flags
 UPDATE_ENV=false
 DAEMON_MODE=false
+STOP_MODE=false
+STATUS_MODE=false
 ENV_MODE=""
-for arg in "$@"; do
-  case "$arg" in
-    --update_environment) UPDATE_ENV=true ;;
-    --copy_environment)   ENV_MODE="copy" ;;
-    --link_environment)   ENV_MODE="link" ;;
-    --daemon)             DAEMON_MODE=true ;;
+ENV_FILE=""
+NAME_EXPLICIT=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name)
+      if [ -z "${2:-}" ]; then
+        echo "ERROR: --name requires a value" >&2
+        exit 2
+      fi
+      CLAUDE_CONTAINER_NAME="$2"
+      NAME_EXPLICIT=true
+      shift 2
+      ;;
+    --env-file)
+      if [ -z "${2:-}" ]; then
+        echo "ERROR: --env-file requires a value" >&2
+        exit 2
+      fi
+      ENV_FILE="$2"
+      shift 2
+      ;;
+    --update_environment) UPDATE_ENV=true; shift ;;
+    --copy_environment)   ENV_MODE="copy"; shift ;;
+    --link_environment)   ENV_MODE="link"; shift ;;
+    --daemon)             DAEMON_MODE=true; shift ;;
+    --stop)               STOP_MODE=true;   shift ;;
+    --status)             STATUS_MODE=true; shift ;;
     --help|-h)
       cat <<'HELP'
 Usage: claude-docker.sh [OPTIONS]
@@ -79,6 +80,14 @@ Persistent worker mode (for MCP dispatch):
                         — generate a template with `make docker-config`.
   --stop                Stop the persistent worker.
   --status              Show worker status. Exit 1 if not running.
+  --name NAME           Override the container name. Applies to --daemon,
+                        --stop, --status, and interactive mode. Enables
+                        running multiple named workers side-by-side.
+                        Defaults to $CLAUDE_CONTAINER_NAME (claude-worker).
+  --env-file FILE       Load additional env vars from FILE (docker
+                        --env-file format) into the started container.
+                        Use for per-project credentials (GH_TOKEN,
+                        GIT_SSH_COMMAND, etc.).
 
 API keys and secrets:
   Create set-environment-vars.conf in the project directory listing files
@@ -116,8 +125,41 @@ Examples:
 HELP
       exit 0
       ;;
+    *) shift ;;
   esac
 done
+
+# Handle worker lifecycle subcommands before any setup or image build.
+if [ "$STOP_MODE" = true ]; then
+  if docker stop "$CLAUDE_CONTAINER_NAME" >/dev/null 2>&1; then
+    echo "Claude worker stopped: $CLAUDE_CONTAINER_NAME"
+  else
+    echo "No running worker: $CLAUDE_CONTAINER_NAME"
+  fi
+  exit 0
+fi
+
+if [ "$STATUS_MODE" = true ]; then
+  if docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" --format '{{.Names}}' | grep -q "^${CLAUDE_CONTAINER_NAME}$"; then
+    docker ps --filter "name=^${CLAUDE_CONTAINER_NAME}$" \
+      --format $'Name: {{.Names}}\nStatus: {{.Status}}\nUptime: {{.RunningFor}}'
+    exit 0
+  else
+    echo "No running worker: $CLAUDE_CONTAINER_NAME"
+    exit 1
+  fi
+fi
+
+# Resolve --env-file to a docker flag; fail fast if the user pointed to a
+# file that isn't there rather than silently launching without those creds.
+ENV_FILE_FLAG=""
+if [ -n "$ENV_FILE" ]; then
+  if [ ! -f "$ENV_FILE" ]; then
+    echo "ERROR: --env-file not found: $ENV_FILE" >&2
+    exit 2
+  fi
+  ENV_FILE_FLAG="--env-file $ENV_FILE"
+fi
 
 # --daemon: if a worker is already running, report and exit before any setup.
 if [ "$DAEMON_MODE" = true ]; then
@@ -436,6 +478,7 @@ if [ "$DAEMON_MODE" = true ]; then
     $SSH_MOUNTS \
     $DISPATCH_MOUNTS \
     $ENV_VARS \
+    $ENV_FILE_FLAG \
     -e CLAUDE_DAEMON=1 \
     -e TERM=xterm-256color \
     -w /workspace \
@@ -449,9 +492,15 @@ if [ "$DAEMON_MODE" = true ]; then
   exit 0
 fi
 
+if [ "$NAME_EXPLICIT" = true ]; then
+  INTERACTIVE_NAME="$CLAUDE_CONTAINER_NAME"
+else
+  INTERACTIVE_NAME="claude-$(basename "$PROJECT_DIR")"
+fi
+
 echo "==> Starting Claude (env: ${ENV_MODE:-none})..."
 exec docker run -it --rm \
-  --name "claude-$(basename "$PROJECT_DIR")" \
+  --name "$INTERACTIVE_NAME" \
   --network host \
   $GPU_FLAG \
   -v "$PROJECT_DIR":"$PROJECT_DIR" \
@@ -471,6 +520,7 @@ exec docker run -it --rm \
   $RO_MOUNTS \
   $HOST_TOOL_MOUNTS \
   $ENV_VARS \
+  $ENV_FILE_FLAG \
   -e TERM=xterm-256color \
   -w "$PROJECT_DIR" \
   "$IMAGE_NAME"

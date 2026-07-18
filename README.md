@@ -51,7 +51,7 @@ Create `set-environment-vars.conf` in your project directory listing files to mo
 ```
 setOpenAIKey.sh
 setOpenRouterKey.sh
-/etc/evolvix/env.sh
+/etc/mycompany/env.sh
 ~/.claude-docker-keys/github_ed25519
 ```
 
@@ -128,6 +128,76 @@ No-op when not in a worktree.
 ## Host tools
 
 `gh` is mounted from the host into the container (resolved via `command -v`), so the container picks up whichever install you already have. `git` is installed in the image.
+
+## Make targets
+
+`make help` prints all targets. Quick reference:
+
+| Target | What it does |
+|---|---|
+| `make docker-config` | Generate `~/.claude/docker.env` template (chmod 600). If it exists, print a diff of missing keys. |
+| `make docker-build` | Build the base image (`claude`, `git`, `gh`, `node`). |
+| `make docker-add-latex` | Layer TeX Live 2026 + latexmk onto the image. |
+| `make docker-add-python-sci` | Layer `python3` + numpy/scipy/matplotlib/pandas onto the image. |
+| `make docker-add-ollama` | Layer the ollama client onto the image. |
+| `make docker-run` | Wrapper for `./claude-docker.sh` (interactive). |
+| `make docker-daemon` / `docker-status` / `docker-stop` | Persistent worker lifecycle. |
+| `make docker-clean` | Stop the worker and remove the image + derived containers. |
+
+## Persistent worker mode
+
+`./claude-docker.sh --daemon` starts a long-lived worker container that a dispatcher (MCP server, cron, etc.) can drive via `docker exec`. Interactive mode is unchanged — the same script handles both.
+
+Configuration lives in `~/.claude/docker.env` (generate with `make docker-config`) or the environment. All `CLAUDE_*` vars have generic defaults:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `CLAUDE_CONTAINER_NAME` | `claude-worker` | Container name (must match the dispatcher's config). |
+| `CLAUDE_PROJECTS_DIR` | `$HOME/claude-projects` | Persistent project clones; mounted at `/workspace/projects`. |
+| `CLAUDE_DISPATCH_DIR` | `/tmp/claude-dispatch` | Per-dispatch worktrees; mounted at `/workspace/dispatch`. |
+| `CLAUDE_MCP_HOST` | `host.docker.internal` | MCP server hostname (added via Docker's `--add-host=…:host-gateway`). |
+| `CLAUDE_MCP_PORT` | `8765` | MCP server port. |
+
+Daemon mode also:
+- Mounts `$HOME/.ssh:/home/node/.ssh:ro`, so the container inherits the host's `~/.ssh/config` alias → key mapping. Use aliases in repo URLs (e.g. `git@github-foo:org/repo.git`).
+- Adds `--add-host=host.docker.internal:host-gateway`, so `http://host.docker.internal:$CLAUDE_MCP_PORT/mcp` reaches an MCP server running on the host.
+- Does **not** set git identity. The dispatcher injects it per-dispatch: `docker exec -e GIT_AUTHOR_NAME=… -e GIT_COMMITTER_NAME=… -e GIT_AUTHOR_EMAIL=… -e GIT_COMMITTER_EMAIL=… claude-worker claude "…"`.
+
+Lifecycle:
+
+```sh
+./claude-docker.sh --daemon    # start (idempotent — reports "already running")
+./claude-docker.sh --status    # exit 0 if running, 1 otherwise
+./claude-docker.sh --stop
+```
+
+## Optional image features
+
+The base image (`make docker-build`) is deliberately minimal — `claude`, `git`, `gh`, `node`, plus runtime `.so` deps. Heavy dependencies are separate overlays that layer on top:
+
+```sh
+make docker-add-latex         # TeX Live 2026 (~4 GB)
+make docker-add-python-sci    # python3 + numpy/scipy/matplotlib/pandas
+make docker-add-ollama        # ollama client
+```
+
+Each overlay re-tags `claude-code-env` with the new layer on top of the current tag, so they compose. `make docker-build` rebuilds from the base Dockerfile and discards prior overlays.
+
+`./claude-docker.sh` **skips the build if the image already exists**, so overlays persist across interactive runs. To force a rebuild, run `make docker-build`.
+
+## Troubleshooting
+
+**`make docker-add-*` fails with "Base image not built"**
+Run `make docker-build` first.
+
+**Container can't reach the MCP server at `host.docker.internal`**
+Daemon mode adds `--add-host=host.docker.internal:host-gateway` automatically. On Linux this requires Docker Engine ≥ 20.10. Interactive mode uses `--network host`, so use `localhost` there instead.
+
+**SSH push fails inside the daemon container**
+`~/.ssh` is mounted read-only. Ensure your host `~/.ssh/config` uses relative (`~/.ssh/…`) or container-path (`/home/node/.ssh/…`) `IdentityFile` entries — absolute host paths that don't exist inside the container won't resolve.
+
+**Overlays got wiped after running `./claude-docker.sh`**
+Shouldn't happen — the script skips the build when the image exists. If it did, check `docker image ls claude-code-env` and re-run the relevant `make docker-add-*` targets.
 
 ## Is this safe?
 The [script](claude-docker.sh) is short. If you're unsure, paste it into Claude and ask _"Is this script safe to run?"_

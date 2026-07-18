@@ -1,0 +1,15 @@
+# Ollama client overlay — installs the ollama binary. Point it at a host
+# ollama server by setting OLLAMA_HOST=http://host.docker.internal:11434
+# inside the container.
+FROM claude-code-env
+
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl ca-certificates \
+    && curl -fsSL https://ollama.com/install.sh | sh \
+    && apt-get purge -y curl \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+USER node

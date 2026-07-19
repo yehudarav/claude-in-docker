@@ -22,6 +22,7 @@ ENV_MODE=""
 ENV_FILE=""
 NAME_EXPLICIT=false
 EXTRA_ENV_FLAGS=()
+EXTRA_VOLUME_FLAGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name)
@@ -47,6 +48,14 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       EXTRA_ENV_FLAGS+=(-e "$2")
+      shift 2
+      ;;
+    -v)
+      if [ -z "${2:-}" ]; then
+        echo "ERROR: -v requires a value" >&2
+        exit 2
+      fi
+      EXTRA_VOLUME_FLAGS+=(-v "$2")
       shift 2
       ;;
     --update_environment) UPDATE_ENV=true; shift ;;
@@ -492,6 +501,7 @@ if [ "$DAEMON_MODE" = true ]; then
     $ENV_VARS \
     $ENV_FILE_FLAG \
     "${EXTRA_ENV_FLAGS[@]}" \
+    "${EXTRA_VOLUME_FLAGS[@]}" \
     -e CLAUDE_DAEMON=1 \
     -e TERM=xterm-256color \
     -w /workspace \
@@ -535,6 +545,7 @@ exec docker run -it --rm \
   $ENV_VARS \
   $ENV_FILE_FLAG \
   "${EXTRA_ENV_FLAGS[@]}" \
+  "${EXTRA_VOLUME_FLAGS[@]}" \
   -e TERM=xterm-256color \
   -w "$PROJECT_DIR" \
   "$IMAGE_NAME"

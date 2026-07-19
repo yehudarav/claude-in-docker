@@ -21,6 +21,7 @@ STATUS_MODE=false
 ENV_MODE=""
 ENV_FILE=""
 NAME_EXPLICIT=false
+EXTRA_ENV_FLAGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --name)
@@ -38,6 +39,14 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       ENV_FILE="$2"
+      shift 2
+      ;;
+    -e)
+      if [ -z "${2:-}" ]; then
+        echo "ERROR: -e requires a value" >&2
+        exit 2
+      fi
+      EXTRA_ENV_FLAGS+=(-e "$2")
       shift 2
       ;;
     --update_environment) UPDATE_ENV=true; shift ;;
@@ -88,6 +97,9 @@ Persistent worker mode (for MCP dispatch):
                         --env-file format) into the started container.
                         Use for per-project credentials (GH_TOKEN,
                         GIT_SSH_COMMAND, etc.).
+  -e KEY=VALUE          Pass an env var to the started container.
+                        Repeatable. Values may contain spaces when
+                        quoted, e.g. -e "GIT_SSH_COMMAND=ssh -i ...".
 
 API keys and secrets:
   Create set-environment-vars.conf in the project directory listing files
@@ -479,6 +491,7 @@ if [ "$DAEMON_MODE" = true ]; then
     $DISPATCH_MOUNTS \
     $ENV_VARS \
     $ENV_FILE_FLAG \
+    "${EXTRA_ENV_FLAGS[@]}" \
     -e CLAUDE_DAEMON=1 \
     -e TERM=xterm-256color \
     -w /workspace \
@@ -521,6 +534,7 @@ exec docker run -it --rm \
   $HOST_TOOL_MOUNTS \
   $ENV_VARS \
   $ENV_FILE_FLAG \
+  "${EXTRA_ENV_FLAGS[@]}" \
   -e TERM=xterm-256color \
   -w "$PROJECT_DIR" \
   "$IMAGE_NAME"

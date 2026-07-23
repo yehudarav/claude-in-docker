@@ -11,7 +11,12 @@ fi
 
 CLAUDE_CONTAINER_NAME="${CLAUDE_CONTAINER_NAME:-claude-worker}"
 CLAUDE_PROJECTS_DIR="${CLAUDE_PROJECTS_DIR:-$HOME/claude-projects}"
-CLAUDE_DISPATCH_DIR="${CLAUDE_DISPATCH_DIR:-/tmp/claude-dispatch}"
+# Default under $HOME so /workspace/dispatch survives host reboot. /tmp is
+# tmpfs on many distros (and swept by systemd-tmpfiles even when not) — a
+# reboot returned /workspace/dispatch empty and root-owned, losing in-flight
+# worktrees + run state (evolvix#697). Callers can still point elsewhere via
+# CLAUDE_DISPATCH_DIR; the ownership fix below runs regardless.
+CLAUDE_DISPATCH_DIR="${CLAUDE_DISPATCH_DIR:-$HOME/claude-dispatch}"
 
 # Parse flags
 UPDATE_ENV=false
@@ -90,7 +95,7 @@ Persistent worker mode (for MCP dispatch):
                         The dispatcher drives it via `docker exec`. Mounts
                         $CLAUDE_PROJECTS_DIR (default ~/claude-projects) at
                         /workspace/projects and $CLAUDE_DISPATCH_DIR (default
-                        /tmp/claude-dispatch) at /workspace/dispatch. Mounts
+                        ~/claude-dispatch) at /workspace/dispatch. Mounts
                         $HOME/.ssh read-only so the container inherits your
                         host's key-alias mapping. Container is named
                         $CLAUDE_CONTAINER_NAME (default claude-worker).
@@ -507,6 +512,16 @@ if [ "$DAEMON_MODE" = true ]; then
     -w /workspace \
     "$IMAGE_NAME" \
     tail -f /dev/null >/dev/null
+
+  # Guarantee /workspace is owned by the runtime user (node, uid 1000) every
+  # time we start. A bind mount inherits the host directory's ownership, which
+  # is how /workspace came back root-owned after a reboot recreated the tmp
+  # source (evolvix#697). Dockerfile-time chown is not enough — it applies to
+  # the image, not to a mount that overlays it. `docker exec -u 0` bypasses
+  # the image USER so this works whichever way the image was built.
+  docker exec -u 0 "$CLAUDE_CONTAINER_NAME" \
+    chown -R node:node /workspace >/dev/null 2>&1 || \
+    echo "WARN: could not chown /workspace to node:node in $CLAUDE_CONTAINER_NAME" >&2
 
   echo "Claude worker started (container: $CLAUDE_CONTAINER_NAME)"
   echo "  Projects:  /workspace/projects  (host: $CLAUDE_PROJECTS_DIR)"

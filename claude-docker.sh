@@ -913,6 +913,11 @@ Other options:
   --update_environment  Snapshot the current host Python environment into
                         requirements.txt before starting. Combine with either
                         mode, e.g.: --update_environment --copy_environment
+                        Packages installed from a local directory (pip freeze
+                        renders them `NAME @ file:///path`) are NOT captured:
+                        each one would bind-mount that host path into every
+                        container, undeclared in capabilities.conf. Add such a
+                        line by hand if a container genuinely needs it.
   --help, -h            Show this help message and exit.
 
 Persistent worker mode (for MCP dispatch):
@@ -1255,11 +1260,40 @@ mkdir -p "$HOME/.claude/projects/$PROJECT_SLUG"
 mkdir -p "$VENV_DIR"
 
 
-# Update requirements.txt from current environment if requested
+# Update requirements.txt from current environment if requested.
+#
+# `pip freeze` renders a local-directory install as `NAME @ file:///abs/path`,
+# and the LOCAL_MOUNTS block below turns every such line into a bind mount of
+# that host path — a mount that appears nowhere in capabilities.conf, which is
+# meant to be the only place a container's host access is declared. Snapshot a
+# venv shared across projects and every project inherits those mounts: the
+# evolvix worker was mounting (and rebuilding, on every container start)
+# ~/Development/NPEET, a package that repo neither imports nor tests. So drop
+# those lines from the snapshot — a local package that should reach a container
+# gets declared deliberately, not inherited from whatever the host venv holds.
+# The hand-declared path still works: LOCAL_MOUNTS and entrypoint.sh read any
+# `@ file://` line present in the file, wherever it came from.
+#
+# Freeze to a temp file first. `pip freeze > requirements.txt` truncates the
+# target before pip runs, so a failing freeze (wrong venv, no pip on PATH)
+# leaves an empty file behind and the next copy-mode start installs nothing.
 if [ "$UPDATE_ENV" = true ]; then
   echo "==> Updating requirements.txt from current Python environment..."
-  pip freeze > "$SCRIPT_DIR/requirements.txt"
+  FREEZE_TMP=$(mktemp)
+  if ! pip freeze > "$FREEZE_TMP" || [ ! -s "$FREEZE_TMP" ]; then
+    rm -f "$FREEZE_TMP"
+    echo "ERROR: \`pip freeze\` produced nothing — leaving requirements.txt untouched." >&2
+    echo "       Check that pip resolves to the environment you meant (\`pip --version\`)." >&2
+    exit 1
+  fi
+  grep -v '@ file://' "$FREEZE_TMP" > "$SCRIPT_DIR/requirements.txt" || true
   echo "    $(wc -l < "$SCRIPT_DIR/requirements.txt") packages captured."
+  while IFS= read -r skipped_pkg; do
+    [ -n "$skipped_pkg" ] || continue
+    echo "    skipped local-path package (declare it in the file by hand if a"
+    echo "    container needs it): $skipped_pkg"
+  done < <(grep '@ file://' "$FREEZE_TMP" || true)
+  rm -f "$FREEZE_TMP"
 fi
 
 # Check if requirements.txt exists for the mount
@@ -1268,14 +1302,19 @@ if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
   REQ_MOUNT="-v $SCRIPT_DIR/requirements.txt:/tmp/requirements.txt:ro"
 fi
 
-# Build mount flags for local development packages
+# Build mount flags for local development packages.
+#
+# Read-only, like the PYTHONPATH dev-package mounts below: both hand a host
+# source tree to the container so `import` resolves there, and the two should
+# not differ on write access. (Read-only is enough to install from: pip copies
+# a local directory to a temp build dir rather than building in place.)
 LOCAL_MOUNTS=""
 if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
   while IFS= read -r pkg_path; do
     if [ -d "$pkg_path" ]; then
-      LOCAL_MOUNTS="$LOCAL_MOUNTS -v $pkg_path:$pkg_path"
+      LOCAL_MOUNTS="$LOCAL_MOUNTS -v $pkg_path:$pkg_path:ro"
     fi
-  done < <(grep '@ file://' "$SCRIPT_DIR/requirements.txt" | sed 's/.*@ file:\/\///')
+  done < <(grep '@ file://' "$SCRIPT_DIR/requirements.txt" | sed 's/.*@ file:\/\///' || true)
 fi
 
 # Build the base image on first run only. Subsequent runs skip this so
